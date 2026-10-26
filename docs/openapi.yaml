@@ -1,0 +1,315 @@
+openapi: 3.0.3
+info:
+  title: Transaction Ledger API
+  version: 1.0.0
+  description: |
+    Accounts, credit/debit transactions, balances, paginated history and atomic transfers.
+
+    * Amounts are decimal numbers in major units with at most 2 decimal places (e.g. `19.99`).
+      They are stored internally as integer minor units, so arithmetic is exact.
+    * Every error uses the same envelope: `{ "error": { "code", "message", "details?" } }`.
+servers:
+  - url: http://localhost:3000
+tags:
+  - name: Accounts
+  - name: Transactions
+  - name: Transfers
+
+paths:
+  /accounts:
+    post:
+      tags: [Accounts]
+      summary: Create an account
+      description: The balance always starts at 0. `id`, `balance` and `created_at` are system-generated and are rejected if sent.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, maxLength: 100, example: Alice }
+      responses:
+        '201':
+          description: Created
+          headers:
+            Location: { schema: { type: string }, description: URL of the new account }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+
+  /accounts/{accountId}:
+    get:
+      tags: [Accounts]
+      summary: Get an account
+      parameters: [{ $ref: '#/components/parameters/AccountId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Account' }
+        '404': { $ref: '#/components/responses/AccountNotFound' }
+
+  /accounts/{accountId}/balance:
+    get:
+      tags: [Accounts]
+      summary: Get the current balance
+      parameters: [{ $ref: '#/components/parameters/AccountId' }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  account_id: { type: string, format: uuid }
+                  balance: { type: number, example: 150 }
+        '404': { $ref: '#/components/responses/AccountNotFound' }
+
+  /accounts/{accountId}/transactions:
+    post:
+      tags: [Transactions]
+      summary: Add a credit or debit transaction
+      description: |
+        The transaction insert and the balance update happen in one database transaction.
+        `reference_id` is unique per account. Resubmitting the same reference returns `409` with the
+        original transaction and changes nothing. The same reference may be used on other accounts.
+      parameters: [{ $ref: '#/components/parameters/AccountId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [type, amount, reference_id]
+              properties:
+                type: { type: string, enum: [credit, debit] }
+                amount: { type: number, exclusiveMinimum: true, minimum: 0, maximum: 1000000000, example: 50 }
+                description: { type: string, maxLength: 255, example: Salary }
+                reference_id: { type: string, minLength: 1, maxLength: 100, example: order-1001 }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  transaction: { $ref: '#/components/schemas/Transaction' }
+                  balance: { type: number, description: Account balance after this transaction }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/AccountNotFound' }
+        '409': { $ref: '#/components/responses/DuplicateTransaction' }
+        '422': { $ref: '#/components/responses/InsufficientBalance' }
+    get:
+      tags: [Transactions]
+      summary: Transaction history (latest first, filterable, paginated)
+      parameters:
+        - { $ref: '#/components/parameters/AccountId' }
+        - { name: type, in: query, schema: { type: string, enum: [credit, debit] }, description: Omit to return both }
+        - { name: page, in: query, schema: { type: integer, minimum: 1, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 10 } }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Transaction' }
+                  pagination:
+                    type: object
+                    properties:
+                      page: { type: integer, example: 1 }
+                      limit: { type: integer, example: 10 }
+                      total_records: { type: integer, example: 42 }
+                      total_pages: { type: integer, example: 5 }
+        '400':
+          description: Invalid pagination (`INVALID_PAGINATION`) or invalid type filter (`VALIDATION_ERROR`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/AccountNotFound' }
+
+  /accounts/{accountId}/transactions/{transactionId}:
+    put:
+      tags: [Transactions]
+      summary: Not allowed. Transactions are immutable.
+      parameters:
+        - { $ref: '#/components/parameters/AccountId' }
+        - { name: transactionId, in: path, required: true, schema: { type: string } }
+      responses:
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+    patch:
+      tags: [Transactions]
+      summary: Not allowed. Transactions are immutable.
+      parameters:
+        - { $ref: '#/components/parameters/AccountId' }
+        - { name: transactionId, in: path, required: true, schema: { type: string } }
+      responses:
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+    delete:
+      tags: [Transactions]
+      summary: Not allowed. Transactions are immutable.
+      parameters:
+        - { $ref: '#/components/parameters/AccountId' }
+        - { name: transactionId, in: path, required: true, schema: { type: string } }
+      responses:
+        '405': { $ref: '#/components/responses/MethodNotAllowed' }
+
+  /transfers:
+    post:
+      tags: [Transfers]
+      summary: Transfer money between two accounts (atomic)
+      description: |
+        Debit of the source and credit of the destination happen in a single database transaction.
+        Either both legs are saved or neither is. Both legs show up in each account's history,
+        linked by `transfer_id`. The caller's `reference_id` belongs to the sender's debit entry
+        (a duplicate returns `409` with the sender's own transaction). The receiver's credit entry
+        gets the system reference `transfer:<transfer_id>`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [from_account_id, to_account_id, amount, reference_id]
+              properties:
+                from_account_id: { type: string, format: uuid }
+                to_account_id: { type: string, format: uuid, description: Must differ from from_account_id }
+                amount: { type: number, example: 30 }
+                description: { type: string, maxLength: 255 }
+                reference_id: { type: string, example: transfer-2001 }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  transfer: { $ref: '#/components/schemas/Transfer' }
+                  debit: { $ref: '#/components/schemas/Transaction' }
+                  credit: { $ref: '#/components/schemas/Transaction' }
+                  balances:
+                    type: object
+                    additionalProperties: { type: number }
+                    description: Map of account_id to balance after the transfer
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '404': { $ref: '#/components/responses/AccountNotFound' }
+        '409': { $ref: '#/components/responses/DuplicateTransaction' }
+        '422': { $ref: '#/components/responses/InsufficientBalance' }
+
+  /health:
+    get:
+      summary: Liveness check
+      responses:
+        '200': { description: OK }
+
+components:
+  parameters:
+    AccountId:
+      name: accountId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+
+  schemas:
+    Account:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string, example: Alice }
+        balance: { type: number, example: 0 }
+        created_at: { type: string, format: date-time }
+    Transaction:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        account_id: { type: string, format: uuid }
+        type: { type: string, enum: [credit, debit] }
+        amount: { type: number, example: 50 }
+        description: { type: string, nullable: true }
+        reference_id: { type: string }
+        transfer_id: { type: string, format: uuid, nullable: true }
+        created_at: { type: string, format: date-time }
+    Transfer:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        from_account_id: { type: string, format: uuid }
+        to_account_id: { type: string, format: uuid }
+        amount: { type: number }
+        description: { type: string, nullable: true }
+        reference_id: { type: string }
+        created_at: { type: string, format: date-time }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                [VALIDATION_ERROR, INVALID_JSON, INVALID_PAGINATION, ACCOUNT_NOT_FOUND, INSUFFICIENT_BALANCE, BALANCE_LIMIT_EXCEEDED,
+                 DUPLICATE_TRANSACTION, METHOD_NOT_ALLOWED, NOT_FOUND, INTERNAL_ERROR]
+            message: { type: string }
+            details: {}
+
+  responses:
+    ValidationError:
+      description: Invalid request body (`VALIDATION_ERROR` with field details, or `INVALID_JSON`)
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: Invalid request data
+              details: [{ field: amount, message: amount must be greater than 0 }]
+    AccountNotFound:
+      description: Account does not exist
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { error: { code: ACCOUNT_NOT_FOUND, message: "Account 'x' not found", details: { account_id: x } } }
+    DuplicateTransaction:
+      description: reference_id already used on this account. Nothing was changed.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: DUPLICATE_TRANSACTION
+              message: "A transaction with reference_id 'order-1001' already exists for this account"
+              details: { existing_transaction: { id: '...', reference_id: order-1001, amount: 50, type: credit } }
+    InsufficientBalance:
+      description: |
+        `INSUFFICIENT_BALANCE`: the debit exceeds the available balance.
+        `BALANCE_LIMIT_EXCEEDED`: the credit would push the balance past 2^53 - 1 minor units.
+        In both cases nothing was changed.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: INSUFFICIENT_BALANCE
+              message: Insufficient balance for this debit
+              details: { account_id: '...', balance: 100, requested_amount: 150 }
+    MethodNotAllowed:
+      description: Transactions are immutable
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
